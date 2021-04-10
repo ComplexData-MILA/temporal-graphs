@@ -122,6 +122,7 @@ class Trainer:
                 val_ap, val_auc = self.test(self.val_data)
 
                 metrics = {
+                    'epoch': epoch,
                     'train_loss': loss,
                     'val_ap': val_ap,
                     'val_auc': val_auc
