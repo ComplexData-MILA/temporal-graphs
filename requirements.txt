@@ -1,0 +1,3 @@
+torchsnooper
+wandb
+simple_slurm
