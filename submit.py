@@ -13,10 +13,10 @@ slurm = Slurm(
 )
 
 datasets = ('lastfm', )
-models = ('tgn', 'tsam')
+models = ('tgn', 'tsam', )
 
 
 for dataset, model in itertools.product(datasets, models):
-    cmd = f'python train.py --dataset {dataset} --memory_type {model} --use_wandb --wandb_group "{datetime.now()}"'
+    cmd = f'python train.py --dataset {dataset} --memory_type {model} --use_wandb --wandb_group "{datetime.now()}" --rank {Slurm.SLURM_ARRAY_TASK_ID}'
     print(f'Scheduling command:\n{cmd}')
-    print(slurm.sbatch(cmd)) # _run{Slurm.SLURM_ARRAY_TASK_ID}
+    print(slurm.sbatch(cmd))

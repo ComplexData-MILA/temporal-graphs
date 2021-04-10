@@ -25,9 +25,14 @@ def launch_wandb(args):
     config = dict(vars(args))
     config.pop('wandb_group')
     config.pop('use_wandb')
+    config.pop('rank')
+
+    name = f'%s_%s' % (os.environ['USER'], datetime.now().strftime('%F_%T'))
+    if args.wandb_group:
+        name = name + f'_{args.rank:01}'
 
     return wandb.init(
-        name=f'%s_%s' % (os.environ['USER'], datetime.now().strftime('%F_%T')),
+        name=name,
         project='temporal-graphs',
         entity=os.environ.get('WANDB_USER', 'cdlab-mila'),
         config=config,
@@ -60,7 +65,7 @@ def main(
             message_module=IdentityMessage(data.msg.size(-1), memory_dim, time_dim),
             aggregator_module=LastAggregator(),
         )
-    elif memory_type == 'tsm':
+    elif memory_type == 'tsam':
         memory = TSAM(
             data.num_nodes, 
             raw_msg_dim, 
@@ -108,6 +113,7 @@ if __name__ == '__main__':
     parser.add_argument('-lr', '--learning_rate', type=float, default=0.0001)
     parser.add_argument('--use_wandb', action='store_true')
     parser.add_argument('--wandb_group', type=str, required=False)
+    parser.add_argument('--rank', type=int, default=0)
 
     args = parser.parse_args()
     run = launch_wandb(args)
