@@ -7,6 +7,32 @@ from dataclasses import dataclass
 from torch_geometric.datasets import JODIEDataset
 from torch_geometric.nn.models.tgn import LastNeighborLoader
 
+# https://burhan-mudassar.netlify.app/post/power-of-hooks-in-pytorch/
+class ExpireSpanHook:
+    def __init__(self):
+        self.handle = None
+        self.reset()
+
+    def register_hook(self, module):
+        self.handle = module.register_forward_hook(self.hook)
+
+    def hook(self, module, input, output):
+        self.expired += (output > 0).sum().item()
+        self.num_events += output.size(0)
+        return output
+
+    def reset(self):
+        self.expired, self.num_events = 0., 0
+
+    def compute(self):
+        if self.num_events == 0:
+            return 1
+        return self.expired / self.num_events
+
+    def close(self):
+        if self.handle:
+            self.handle.remove()
+
 @dataclass
 class Trainer:
     dataset: JODIEDataset
@@ -17,9 +43,10 @@ class Trainer:
 
     criterion: torch.nn.Module = torch.nn.BCEWithLogitsLoss()
     device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    regularize: bool = False
     
     neighbor_size: int = 10
-    batch_size: int = 100
+    batch_size: int = 200
     epochs: int = 50
     seed: int = 12345
 
@@ -40,6 +67,10 @@ class Trainer:
         self.gnn.to(self.device)
         self.link_pred.to(self.device)
 
+        self._hook = ExpireSpanHook()
+        if self.memory.expire_span:
+            self._hook.register_hook(self.memory.expire_span)
+
     def _forward_on_batch(self, batch):
         src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
 
@@ -52,8 +83,9 @@ class Trainer:
         self.assoc[n_id] = torch.arange(n_id.size(0), device=self.device)
 
         # Get updated memory of all nodes involved in the computation.
-        z, last_update = self.memory(n_id)
-        z = self.gnn(z, last_update, edge_index, self.data.t[e_id], self.data.msg[e_id])
+        prev_mem = self.memory.memory[n_id]
+        cur_mem, last_update = self.memory(n_id)
+        z = self.gnn(cur_mem, last_update, edge_index, self.data.t[e_id], self.data.msg[e_id])
 
         pos_out = self.link_pred(z[self.assoc[src]], z[self.assoc[pos_dst]])
         neg_out = self.link_pred(z[self.assoc[src]], z[self.assoc[neg_dst]])
@@ -62,6 +94,11 @@ class Trainer:
         self.memory.update_state(src, pos_dst, t, msg)
         self.neighbor_loader.insert(src, pos_dst)
 
+        if self.memory.training:
+            reg = 0.
+            if self.regularize:
+                reg = (1 - torch.nn.functional.cosine_similarity(prev_mem, cur_mem)).mean()
+            return pos_out, neg_out, reg
         return pos_out, neg_out
 
     def train(self):
@@ -73,24 +110,34 @@ class Trainer:
         self.neighbor_loader.reset_state()  # Start with an empty graph.
 
         total_loss = 0
-        with tqdm(self.train_data.seq_batches(batch_size=self.batch_size), leave=False) as pbar:
-            for batch in pbar:
+        total_events = 0
+        with tqdm(self.train_data.seq_batches(batch_size=self.batch_size), leave=False, total=self.train_data.num_events // self.batch_size) as pbar:
+            for i, batch in enumerate(pbar, 1):
                 self.optimizer.zero_grad()
 
-                pos_out, neg_out = self._forward_on_batch(batch)
+                pos_out, neg_out, reg = self._forward_on_batch(batch)
 
                 loss = self.criterion(pos_out, torch.ones_like(pos_out))
                 loss += self.criterion(neg_out, torch.zeros_like(neg_out))
+                loss += reg
 
                 loss.backward()
                 self.optimizer.step()
                 self.memory.detach()
 
                 total_loss += loss.item() * batch.num_events
-                pbar.set_description(f'loss: {loss.item():0.4f}')
-                if self.run is not None:
-                    self.run.log({'loss': loss.item()})
+                total_events += batch.num_events
+                
+                span = self._hook.compute()
 
+                pbar.set_description(f'loss: {total_loss / total_events:0.4f}, span: {span:0.4f}') # / total_events
+                if self.run is not None:
+                    metrics = {'loss': loss.item(), 'span': span}
+                    if self.regularize:
+                        metrics['reg'] = reg
+                    self.run.log(metrics)
+
+        self._hook.reset()
         return total_loss / self.train_data.num_events
 
     @torch.no_grad()
@@ -102,7 +149,7 @@ class Trainer:
         torch.manual_seed(self.seed)  # Ensure deterministic sampling across epochs.
 
         aps, aucs = [], []
-        for batch in tqdm(inference_data.seq_batches(batch_size=self.batch_size), leave=False):
+        for batch in tqdm(inference_data.seq_batches(batch_size=self.batch_size), leave=False, total=inference_data.num_events // self.batch_size):
             pos_out, neg_out = self._forward_on_batch(batch)
 
             y_pred = torch.cat([pos_out, neg_out], dim=0).sigmoid().cpu()
